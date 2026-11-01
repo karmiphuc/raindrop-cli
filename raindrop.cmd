@@ -1,2 +1,2 @@
 @echo off
-python "%USERPROFILE%\Documentsaindrop-cliaindrop.py" %*
+python "%USERPROFILE%\Documents\raindrop-cli\raindrop.py" %*
