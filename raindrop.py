@@ -111,7 +111,14 @@ class Client:
     def collections(self) -> list[dict]:
         roots = self.request("GET", "/collections").get("items", [])
         children = self.request("GET", "/collections/childrens").get("items", [])
-        return roots + children
+        # Seen live: the two endpoints can return the same collection; keep the first copy by _id.
+        seen: set = set()
+        out = []
+        for c in roots + children:
+            if c.get("_id") not in seen:
+                seen.add(c.get("_id"))
+                out.append(c)
+        return out
 
     def raindrops(self, collection: int = 0, search: str | None = None, sort: str | None = None,
                   limit: int | None = 20) -> list[dict]:
@@ -164,7 +171,8 @@ def collection_tree(items: list[dict]) -> list[str]:
     lines: list[str] = []
 
     def walk(parent: Any, depth: int) -> None:
-        for c in sorted(by_parent.get(parent, []), key=lambda x: (x.get("sort", 0), x.get("title", ""))):
+        # Real data can have "sort": null and missing titles; never compare None with int/str.
+        for c in sorted(by_parent.get(parent, []), key=lambda x: (x.get("sort") or 0, x.get("title") or "")):
             lines.append(f"{'  ' * depth}{c['_id']:>10}  {c.get('title', '')}  ({c.get('count', 0)})")
             walk(c["_id"], depth + 1)
 

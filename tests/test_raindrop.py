@@ -101,6 +101,22 @@ class RaindropTests(unittest.TestCase):
                 rd.load_token({}, f)
             self.assertIn("settings/integrations", str(ctx.exception))
 
+    def test_collection_tree_tolerates_null_sort_and_title(self):
+        # Seen live on 2026-11-01: some collections come back with "sort": null.
+        items = [{"_id": 1, "title": "A", "sort": None, "count": 1},
+                 {"_id": 2, "title": None, "sort": 3, "count": 0},
+                 {"_id": 3, "title": "C", "count": 2, "parent": {"$id": 1}, "sort": None}]
+        lines = rd.collection_tree(items)
+        self.assertEqual(len(lines), 3)
+
+    def test_collections_dedupes_overlap_between_endpoints(self):
+        c, _, _ = self.client({
+            ("GET", "/collections"): (200, {}, {"result": True, "items": [{"_id": 1, "title": "A"}]}),
+            ("GET", "/collections/childrens"): (200, {}, {"result": True, "items": [
+                {"_id": 1, "title": "A"}, {"_id": 2, "title": "B", "parent": {"$id": 1}}]}),
+        })
+        self.assertEqual([x["_id"] for x in c.collections()], [1, 2])
+
     def test_cli_has_no_delete_command(self):
         with self.assertRaises(SystemExit):
             rd.build_parser().parse_args(["delete", "1"])
