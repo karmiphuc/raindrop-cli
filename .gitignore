@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+token
+*.token
+export*.json
+export*.md
