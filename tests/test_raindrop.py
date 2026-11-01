@@ -8,6 +8,10 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import os  # noqa: E402
+# Tests must never write undo logs into the user's real state folder.
+_STATE = tempfile.mkdtemp(prefix="raindrop-test-state-")
+os.environ["RAINDROP_STATE_DIR"] = _STATE
 
 import raindrop as rd  # noqa: E402
 
@@ -246,3 +250,24 @@ class BulkChangeTests(unittest.TestCase):
         rd.run(["apply", str(plan)], client=self.client, out=buf)
         self.assertIn("dry run", buf.getvalue())
         self.assertNotIn("PUT", [m for m, _ in self.fake.calls])
+
+
+class NoteFileTests(unittest.TestCase):
+    def test_append_note_file_keeps_all_lines(self):
+        # Seen live: a multi-line --append-note through raindrop.cmd kept only the first line.
+        fake = StatefulFake([{"_id": 7, "link": "https://x", "tags": [], "collection": {"$id": -1}, "note": ""}])
+        client = rd.Client(TOKEN, transport=fake, sleep=lambda s: None)
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "note.md"
+            f.write_text("line one\n- line two\n- line three", encoding="utf-8")
+            rd.run(["update", "7", "--append-note-file", str(f), "--add-tags", "claude-done", "--move", "5"],
+                   client=client, out=io.StringIO())
+        item = fake.items[7]
+        self.assertEqual(item["note"], "line one\n- line two\n- line three")
+        self.assertEqual(item["tags"], ["claude-done"])
+        self.assertEqual(item["collection"]["$id"], 5)
+
+
+class StateIsolationTests(unittest.TestCase):
+    def test_default_undo_log_uses_test_state_dir(self):
+        self.assertTrue(str(rd.default_undo_log()).startswith(_STATE))

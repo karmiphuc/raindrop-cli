@@ -233,7 +233,8 @@ def apply_ops(client: Client, ops: list[dict], *, execute: bool, undo_log: Path 
 
 
 def default_undo_log() -> Path:
-    return Path.home() / ".local" / "state" / "raindrop" / f"undo-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    base = Path(os.environ.get("RAINDROP_STATE_DIR") or Path.home() / ".local" / "state" / "raindrop")
+    return base / f"undo-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
 
 
 def _header(headers: dict, name: str) -> str | None:
@@ -325,7 +326,9 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--add-tags", help="comma-separated")
     u.add_argument("--remove-tags", help="comma-separated")
     u.add_argument("--move", type=int, help="target collection id (Trash is refused)")
-    u.add_argument("--append-note", help="text appended to the note (skipped if already present)")
+    u.add_argument("--append-note", help="text appended to the note (skipped if already present); single line")
+    u.add_argument("--append-note-file", help="read the text to append from a UTF-8 file. Use this for multi-line "
+                   "notes: Windows .cmd launchers cut arguments at the first line break")
     u.add_argument("--dry-run", action="store_true")
     ap = sub.add_parser("apply", parents=[common], help="apply a JSON list of ops; dry run unless --yes")
     ap.add_argument("plan")
@@ -381,8 +384,11 @@ def run(argv: list[str], client: Client | None = None, out=None) -> int:
         else:
             out.write(text)
     elif args.cmd == "update":
+        if args.append_note and args.append_note_file:
+            raise RaindropError("use either --append-note or --append-note-file, not both")
+        note = Path(args.append_note_file).read_text(encoding="utf-8-sig") if args.append_note_file else args.append_note
         op = {"id": args.id, "add_tags": _csv(args.add_tags), "remove_tags": _csv(args.remove_tags),
-              "move": args.move, "append_note": args.append_note}
+              "move": args.move, "append_note": note}
         stats = apply_ops(client, [op], execute=not args.dry_run, undo_log=default_undo_log(), throttle=0, out=out)
         emit(stats, f"changed={stats['changed']} unchanged={stats['unchanged']} would_change={stats['would_change']}")
     elif args.cmd in ("apply", "undo"):

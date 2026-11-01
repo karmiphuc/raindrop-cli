@@ -36,6 +36,19 @@ Search accepts Raindrop's search syntax (see https://help.raindrop.io/using-sear
 Behavior: up to 50 items per page with automatic paging; waits and retries on HTTP 429 (rate limit:
 120 requests/minute) and on 5xx; 4xx errors fail immediately with a clear message.
 
+## Writing changes safely
+
+```text
+raindrop update ID [--add-tags a,b] [--remove-tags c] [--move COLLECTION] [--append-note TEXT | --append-note-file FILE] [--dry-run]
+raindrop apply plan.json [--yes] [--undo-log FILE]   # dry run unless --yes; re-running is a no-op
+raindrop undo undo-....jsonl [--yes]                   # restores tags, collection and note
+raindrop new-collection TITLE [--parent ID]
+```
+
+- Every change first records the bookmark's previous state in an undo log (`~/.local/state/raindrop/`,
+  or `RAINDROP_STATE_DIR`). Moving to Trash is refused, and there are no delete commands.
+- Use `--append-note-file` for multi-line notes: Windows `.cmd` launchers cut arguments at the first line break.
+
 ## Tests
 
 ```bash
