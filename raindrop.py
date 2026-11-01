@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """raindrop: a small, dependency-free CLI for Raindrop.io (REST API v1).
 
-Standard library only (no third-party packages). Read and add only: there are no delete commands.
+Standard library only (no third-party packages). No delete commands, and nothing is ever moved to Trash.
+Bulk changes (apply) are dry runs unless --yes, skip items already in the target state, and log previous
+state for `undo`.
 
 Token (never printed): env RAINDROP_TOKEN, else the first line of ~/.config/raindrop/token.
 Create a "Test token" at https://app.raindrop.io/settings/integrations (register an app, open it, copy Test token).
@@ -155,6 +157,84 @@ class Client:
         path = "/tags" if collection is None else f"/tags/{collection}"
         return self.request("GET", path).get("items", [])
 
+    def update(self, rid: int, body: dict) -> dict:
+        return self.request("PUT", f"/raindrop/{rid}", body=body).get("item", {})
+
+    def new_collection(self, title: str, parent: int | None = None) -> dict:
+        body: dict[str, Any] = {"title": title}
+        if parent is not None:
+            body["parent"] = {"$id": parent}
+        return self.request("POST", "/collection", body=body).get("item", {})
+
+
+# --- safe bulk changes -------------------------------------------------------
+# An op changes one bookmark: {"id", "add_tags", "remove_tags", "move", "append_note"}, or, for undo,
+# {"id", "set_tags", "set_collection", "set_note"}. Nothing here deletes or moves to Trash.
+TRASH = -99
+
+
+def plan_change(item: dict, op: dict) -> tuple[dict, dict] | None:
+    """Return (PUT body, previous state) or None when the bookmark is already in the target state."""
+    cur_tags = list(item.get("tags") or [])
+    coll = item.get("collection")
+    cur_coll = coll.get("$id") if isinstance(coll, dict) else coll
+    cur_note = item.get("note") or ""
+    if "set_tags" in op or "set_collection" in op or "set_note" in op:
+        new_tags = op.get("set_tags", cur_tags)
+        new_coll = op.get("set_collection", cur_coll)
+        new_note = op.get("set_note", cur_note)
+    else:
+        remove = set(op.get("remove_tags") or [])
+        new_tags = [t for t in cur_tags if t not in remove]
+        for t in op.get("add_tags") or []:
+            if t not in new_tags:
+                new_tags.append(t)
+        new_coll = op["move"] if op.get("move") is not None else cur_coll
+        add_note = (op.get("append_note") or "").strip()
+        new_note = cur_note if not add_note or add_note in cur_note else (cur_note.rstrip() + "\n\n" + add_note).strip()
+    if new_coll == TRASH:
+        raise RaindropError(f"refusing to move bookmark {item.get('_id')} to Trash: this CLI never deletes")
+    body: dict[str, Any] = {}
+    if new_tags != cur_tags:
+        body["tags"] = new_tags
+    if new_coll != cur_coll:
+        body["collection"] = {"$id": new_coll}
+    if new_note != cur_note:
+        body["note"] = new_note
+    if not body:
+        return None
+    return body, {"id": item.get("_id"), "set_tags": cur_tags, "set_collection": cur_coll, "set_note": cur_note}
+
+
+def apply_ops(client: Client, ops: list[dict], *, execute: bool, undo_log: Path | None,
+              throttle: float = 0.55, sleep: Callable[[float], None] = time.sleep, out=None) -> dict:
+    """Dry run unless execute=True. Writes each item's previous state to undo_log BEFORE changing it."""
+    out = out or sys.stdout
+    stats = {"changed": 0, "unchanged": 0, "would_change": 0}
+    for op in ops:
+        item = client.raindrop(int(op["id"]))
+        planned = plan_change(item, op)
+        if planned is None:
+            stats["unchanged"] += 1
+            continue
+        body, previous = planned
+        if not execute:
+            stats["would_change"] += 1
+            out.write(f"would update {op['id']}: {json.dumps(body, ensure_ascii=False)}\n")
+            continue
+        if undo_log is not None:
+            undo_log.parent.mkdir(parents=True, exist_ok=True)
+            with undo_log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(previous, ensure_ascii=False) + "\n")
+        client.update(int(op["id"]), body)
+        stats["changed"] += 1
+        sleep(throttle)  # each op is a GET + PUT; stays under 120 requests/minute
+    return stats
+
+
+def default_undo_log() -> Path:
+    return Path.home() / ".local" / "state" / "raindrop" / f"undo-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+
 
 def _header(headers: dict, name: str) -> str | None:
     for k, v in headers.items():
@@ -213,7 +293,7 @@ def export_items(items: list[dict]) -> list[dict]:
 
 # --- CLI ---------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="raindrop", description="Dependency-free Raindrop.io CLI (read + add; no deletes).")
+    p = argparse.ArgumentParser(prog="raindrop", description="Dependency-free Raindrop.io CLI (no deletes; bulk changes are dry-run first and undo-logged).")
     p.add_argument("--version", action="version", version=__version__)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="machine-readable JSON output")
@@ -240,7 +320,28 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("-c", "--collection", type=int, default=0)
     e.add_argument("--format", choices=["json", "md"], default="json")
     e.add_argument("-o", "--output", help="write to file instead of stdout")
+    u = sub.add_parser("update", parents=[common], help="tag, move or annotate one bookmark (undo-logged)")
+    u.add_argument("id", type=int)
+    u.add_argument("--add-tags", help="comma-separated")
+    u.add_argument("--remove-tags", help="comma-separated")
+    u.add_argument("--move", type=int, help="target collection id (Trash is refused)")
+    u.add_argument("--append-note", help="text appended to the note (skipped if already present)")
+    u.add_argument("--dry-run", action="store_true")
+    ap = sub.add_parser("apply", parents=[common], help="apply a JSON list of ops; dry run unless --yes")
+    ap.add_argument("plan")
+    ap.add_argument("--yes", action="store_true", help="actually change bookmarks")
+    ap.add_argument("--undo-log", help="where to record previous state (default ~/.local/state/raindrop/)")
+    un = sub.add_parser("undo", parents=[common], help="restore bookmarks from an undo log; dry run unless --yes")
+    un.add_argument("log")
+    un.add_argument("--yes", action="store_true")
+    nc = sub.add_parser("new-collection", parents=[common], help="create a collection")
+    nc.add_argument("title")
+    nc.add_argument("--parent", type=int)
     return p
+
+
+def _csv(value: str | None) -> list[str]:
+    return [t.strip() for t in (value or "").split(",") if t.strip()]
 
 
 def run(argv: list[str], client: Client | None = None, out=None) -> int:
@@ -279,6 +380,24 @@ def run(argv: list[str], client: Client | None = None, out=None) -> int:
             out.write(f"exported {len(items)} bookmark(s) to {args.output}\n")
         else:
             out.write(text)
+    elif args.cmd == "update":
+        op = {"id": args.id, "add_tags": _csv(args.add_tags), "remove_tags": _csv(args.remove_tags),
+              "move": args.move, "append_note": args.append_note}
+        stats = apply_ops(client, [op], execute=not args.dry_run, undo_log=default_undo_log(), throttle=0, out=out)
+        emit(stats, f"changed={stats['changed']} unchanged={stats['unchanged']} would_change={stats['would_change']}")
+    elif args.cmd in ("apply", "undo"):
+        path = Path(args.plan if args.cmd == "apply" else args.log)
+        text = path.read_text(encoding="utf-8")
+        ops = [json.loads(line) for line in text.splitlines() if line.strip()] if args.cmd == "undo" else json.loads(text)
+        if args.cmd == "undo":
+            ops = list(reversed(ops))  # restore in reverse order of changes
+        log = Path(args.undo_log) if args.cmd == "apply" and args.undo_log else default_undo_log()
+        stats = apply_ops(client, ops, execute=args.yes, undo_log=log, out=out)
+        note = f"  undo log: {log}" if args.yes and stats["changed"] else ("" if args.yes else "  (dry run; add --yes to apply)")
+        emit(stats, f"changed={stats['changed']} unchanged={stats['unchanged']} would_change={stats['would_change']}{note}")
+    elif args.cmd == "new-collection":
+        c = client.new_collection(args.title, args.parent)
+        emit(c, f"created collection {c.get('_id')}  {c.get('title')}")
     return 0
 
 

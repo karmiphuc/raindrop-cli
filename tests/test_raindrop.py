@@ -135,8 +135,9 @@ class RaindropTests(unittest.TestCase):
                 self.assertIn("Bé ✓", text)
 
     def test_cli_has_no_delete_command(self):
-        with self.assertRaises(SystemExit):
-            rd.build_parser().parse_args(["delete", "1"])
+        for cmd in ("delete", "remove", "trash"):
+            with self.assertRaises(SystemExit):
+                rd.build_parser().parse_args([cmd, "1"])
 
     def test_cli_json_and_tree_output(self):
         c, _, _ = self.client({
@@ -156,3 +157,92 @@ class RaindropTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatefulFake:
+    """Minimal in-memory Raindrop: GET/PUT /raindrop/{id}. Records every request."""
+
+    def __init__(self, items):
+        self.items = {i["_id"]: json.loads(json.dumps(i)) for i in items}
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        path = urllib.parse.urlparse(url).path.replace("/rest/v1", "", 1)
+        self.calls.append((method, path))
+        rid = int(path.rsplit("/", 1)[1])
+        if method == "PUT":
+            data = json.loads(body)
+            item = self.items[rid]
+            if "tags" in data:
+                item["tags"] = data["tags"]
+            if "collection" in data:
+                item["collection"] = {"$id": data["collection"]["$id"]}
+            if "note" in data:
+                item["note"] = data["note"]
+        return 200, {}, json.dumps({"result": True, "item": self.items[rid]}).encode()
+
+
+class BulkChangeTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = StatefulFake([
+            {"_id": 1, "link": "https://a", "tags": ["bookmark", "ai"], "collection": {"$id": -1}, "note": ""},
+            {"_id": 2, "link": "https://b", "tags": ["7/10/2025"], "collection": {"$id": 5}, "note": "keep me"},
+        ])
+        self.client = rd.Client(TOKEN, transport=self.fake, sleep=lambda s: None)
+        self.ops = [
+            {"id": 1, "remove_tags": ["bookmark"], "add_tags": ["agents"], "move": 42},
+            {"id": 2, "remove_tags": ["7/10/2025"], "append_note": "Claude (2026-11-01): summary"},
+        ]
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = Path(self.tmp.name) / "undo.jsonl"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_ops(self, ops, execute):
+        return rd.apply_ops(self.client, ops, execute=execute, undo_log=self.log, sleep=lambda s: None, out=io.StringIO())
+
+    def test_dry_run_changes_nothing(self):
+        before = json.dumps(self.fake.items, sort_keys=True)
+        stats = self.run_ops(self.ops, execute=False)
+        self.assertEqual(stats["would_change"], 2)
+        self.assertEqual(json.dumps(self.fake.items, sort_keys=True), before)
+        self.assertNotIn("PUT", [m for m, _ in self.fake.calls])
+        self.assertFalse(self.log.exists())
+
+    def test_apply_then_reapply_is_idempotent_and_undo_restores(self):
+        original = json.dumps(self.fake.items, sort_keys=True)
+        self.assertEqual(self.run_ops(self.ops, execute=True)["changed"], 2)
+        self.assertEqual(self.fake.items[1]["tags"], ["ai", "agents"])
+        self.assertEqual(self.fake.items[1]["collection"]["$id"], 42)
+        self.assertEqual(self.fake.items[2]["note"], "keep me\n\nClaude (2026-11-01): summary")
+        again = self.run_ops(self.ops, execute=True)
+        self.assertEqual((again["changed"], again["unchanged"]), (0, 2))  # second run is a no-op
+        undo_ops = [json.loads(l) for l in self.log.read_text(encoding="utf-8").splitlines()][::-1]
+        self.run_ops(undo_ops, execute=True)
+        self.assertEqual(json.dumps(self.fake.items, sort_keys=True), original)
+
+    def test_undo_log_written_before_put(self):
+        order = []
+        real = self.fake.__call__
+
+        def spy(method, url, headers, body):
+            if method == "PUT":
+                order.append(("put", self.log.exists()))
+            return real(method, url, headers, body)
+        self.client = rd.Client(TOKEN, transport=spy, sleep=lambda s: None)
+        self.run_ops(self.ops[:1], execute=True)
+        self.assertEqual(order, [("put", True)])
+
+    def test_move_to_trash_is_refused(self):
+        with self.assertRaises(rd.RaindropError):
+            self.run_ops([{"id": 1, "move": -99}], execute=True)
+        self.assertEqual(self.fake.items[1]["collection"]["$id"], -1)
+
+    def test_cli_apply_is_dry_run_without_yes(self):
+        plan = Path(self.tmp.name) / "plan.json"
+        plan.write_text(json.dumps(self.ops), encoding="utf-8")
+        buf = io.StringIO()
+        rd.run(["apply", str(plan)], client=self.client, out=buf)
+        self.assertIn("dry run", buf.getvalue())
+        self.assertNotIn("PUT", [m for m, _ in self.fake.calls])
