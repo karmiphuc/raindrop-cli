@@ -189,8 +189,10 @@ def export_markdown(items: list[dict]) -> str:
     lines = ["# Raindrop export", ""]
     for r in items:
         tags = f" — tags: {', '.join(r['tags'])}" if r.get("tags") else ""
+        coll = r.get("collection")
+        coll = coll.get("$id") if isinstance(coll, dict) else coll  # raw API item or export_items row
         lines.append(f"- [{(r.get('title') or r.get('link') or '').replace(']', ')')}]({r.get('link')}) "
-                     f"(id {r.get('_id')}, collection {(r.get('collection') or {}).get('$id')}){tags}")
+                     f"(id {r.get('_id')}, collection {coll}){tags}")
         if r.get("note"):
             lines.append(f"  - note: {r['note'].strip()}")
     return "\n".join(lines) + "\n"

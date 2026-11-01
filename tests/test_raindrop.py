@@ -117,6 +117,23 @@ class RaindropTests(unittest.TestCase):
         })
         self.assertEqual([x["_id"] for x in c.collections()], [1, 2])
 
+    def test_export_cli_both_formats_end_to_end(self):
+        # Seen live: md export crashed on export_items rows (collection already flattened to an int).
+        raw = [{"_id": 2, "link": "https://b", "title": "Bé ✓", "tags": ["x"], "collection": {"$id": -1}, "note": "n"},
+               {"_id": 1, "link": "https://a", "title": "A", "collection": {"$id": 7}}]
+        for fmt in ("json", "md"):
+            c, _, _ = self.client({("GET", "/raindrops/0"): (200, {}, {"result": True, "items": [dict(r) for r in raw]})})
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / f"out.{fmt}"
+                rd.run(["export", "--format", fmt, "-o", str(path)], client=c, out=io.StringIO())
+                text = path.read_text(encoding="utf-8")
+            if fmt == "json":
+                self.assertEqual([r["collection"] for r in json.loads(text)], [7, -1])
+            else:
+                self.assertTrue(text.startswith("# Raindrop export"))
+                self.assertIn("collection -1", text)
+                self.assertIn("Bé ✓", text)
+
     def test_cli_has_no_delete_command(self):
         with self.assertRaises(SystemExit):
             rd.build_parser().parse_args(["delete", "1"])
